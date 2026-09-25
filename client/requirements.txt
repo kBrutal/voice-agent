@@ -1,0 +1,5 @@
+# Client dependencies - install with: uv pip install -e ".[client]"
+# Or: uv sync --extra client
+
+pyaudio>=0.2.14
+websockets>=13.0
