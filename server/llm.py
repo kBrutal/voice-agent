@@ -4,16 +4,16 @@ import os
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from server.config import settings
 
 # Load variables from .env
 load_dotenv()
-
 
 # ============================================================
 # Configuration
 # ============================================================
 
-API_KEY = os.getenv("DEEPSEEK_API_KEY")
+API_KEY = settings.deepseek_api_key
 
 if not API_KEY:
     raise RuntimeError(
@@ -21,6 +21,7 @@ if not API_KEY:
     )
 
 MODEL = "deepseek-v4-pro"
+SUMMARIZE_MODEL = "deepseek-chat"  # cheaper model for summarization
 
 BASE_URL = "https://api.deepseek.com"
 
@@ -44,7 +45,7 @@ Therefore:
 
 
 # ============================================================
-# DeepSeek client
+# DeepSeek clients
 # ============================================================
 
 client = OpenAI(
@@ -52,47 +53,77 @@ client = OpenAI(
     base_url=BASE_URL,
 )
 
+# Separate client for summarization (can use different params)
+summarize_client = OpenAI(
+    api_key=API_KEY,
+    base_url=BASE_URL,
+)
+
 
 # ============================================================
-# LLM function
+# LLM functions
 # ============================================================
 
 def generate_response(user_input: str) -> str:
+    """
+    Generate response from user input (stateless, backward compatible).
+    """
+    return generate_response_with_history(user_input, [])
 
+
+def generate_response_with_history(
+    user_input: str, 
+    history: list[dict] | None = None
+) -> str:
+    """
+    Generate response with conversation history.
+    
+    Args:
+        user_input: Current user message
+        history: List of {"role": "user|assistant|system", "content": "..."} messages
+                (excluding the current user input)
+    """
     if not user_input.strip():
-        raise ValueError(
-            "User input cannot be empty."
-        )
-
+        raise ValueError("User input cannot be empty.")
+    
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    
+    if history:
+        messages.extend(history)
+    
+    messages.append({"role": "user", "content": user_input})
+    
     response = client.chat.completions.create(
         model=MODEL,
-
-        messages=[
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT,
-            },
-            {
-                "role": "user",
-                "content": user_input,
-            },
-        ],
-
-        # DeepSeek V4 Pro reasoning
+        messages=messages,
         reasoning_effort="high",
-
-        # DeepSeek-specific parameter
-        # must be passed through extra_body
-        extra_body={
-            "thinking": {
-                "type": "enabled"
-            }
-        },
-
+        extra_body={"thinking": {"type": "enabled"}},
         stream=False,
     )
-
+    
     return response.choices[0].message.content
+
+
+async def summarize_with_deepseek(text: str) -> str:
+    """
+    Summarize text using DeepSeek (cheaper model).
+    Used for conversation summarization.
+    """
+    if not text.strip():
+        return ""
+    
+    response = summarize_client.chat.completions.create(
+        model=SUMMARIZE_MODEL,
+        messages=[
+            {"role": "system", "content": "You are a concise summarizer."},
+            {"role": "user", "content": text}
+        ],
+        max_tokens=200,
+        temperature=0.3,
+        stream=False,
+    )
+    
+    return response.choices[0].message.content.strip()
 
 
 # ============================================================
@@ -100,7 +131,6 @@ def generate_response(user_input: str) -> str:
 # ============================================================
 
 def main():
-
     parser = argparse.ArgumentParser(
         description="DeepSeek V4 Pro LLM"
     )
@@ -112,9 +142,7 @@ def main():
 
     args = parser.parse_args()
 
-    response = generate_response(
-        args.input
-    )
+    response = generate_response(args.input)
 
     print("\nResponse:")
     print(response)

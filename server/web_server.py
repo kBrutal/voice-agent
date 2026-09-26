@@ -15,6 +15,7 @@ from .pipeline import process_audio
 from .asr import transcribe
 from .llm import generate_response
 from .tts import synthesize
+from .config import settings
 
 
 # In-memory session storage (replace with Redis for production)
@@ -53,7 +54,6 @@ def convert_webm_to_wav(webm_data: bytes, target_sr: int = 16000) -> bytes:
     except Exception as e:
         Path(webm_path).unlink(missing_ok=True)
         raise RuntimeError(f"Audio conversion failed: {e}")
-        return wav_data
     finally:
         Path(webm_path).unlink(missing_ok=True)
 
@@ -148,14 +148,25 @@ async def lifespan(app: FastAPI):
     # Startup
     static_dir = Path(__file__).parent / "static"
     static_dir.mkdir(exist_ok=True)
+    
+    # Initialize memory store
+    from .memory import get_memory_store
+    memory = get_memory_store()
+    await memory.connect()
+    
     yield
+    
     # Shutdown
     sessions.clear()
+    from .memory import get_memory_store
+    store = get_memory_store()
+    if store:
+        await store.close()
 
 
 app = FastAPI(title="Voice Assistant", lifespan=lifespan)
 
-# Track active WebSocket connections to prevent duplicates
+# Track active WebSocket connections
 active_websockets: dict[str, WebSocket] = {}
 
 # Serve static files
@@ -180,12 +191,15 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     active_websockets[session_id] = websocket
     print(f"WebSocket connected: {session_id}")
 
+    # User ID (single user for now)
+    user_id = settings.default_user_id
+
     sessions[session_id] = {
         "audio_buffer": bytearray(),
         "sample_rate": 16000,
         "channels": 1,
         "busy": False,
-        "send_lock": send_lock,
+        "send_lock": asyncio.Lock(),
     }
     session = sessions[session_id]
     process_task: asyncio.Task | None = None
@@ -210,7 +224,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             elif msg_type == "audio_end":
                 print(f"WS {session_id} audio_end, processing...")
                 if session["busy"]:
-                    await send_json(websocket, send_lock, {
+                    await send_json(websocket, session["send_lock"], {
                         "type": "error",
                         "message": "Already processing a request",
                     })
@@ -225,6 +239,12 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 session["channels"] = message.get("channels", 1)
                 print(f"WS {session_id} config: {session['sample_rate']}Hz, {session['channels']}ch")
 
+            elif msg_type == "interrupt":
+                print(f"WS {session_id} interrupt received")
+                session["busy"] = False
+                if session.get("process_task") and not session["process_task"].done():
+                    session["process_task"].cancel()
+
     except WebSocketDisconnect:
         print(f"Session {session_id} disconnected")
     except Exception as e:
@@ -232,23 +252,16 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         import traceback
         traceback.print_exc()
         try:
-            await send_json(websocket, send_lock, {
+            await send_json(websocket, session["send_lock"], {
                 "type": "error",
                 "message": str(e),
             })
         except Exception:
             pass
     finally:
-        if process_task and not process_task.done():
-            process_task.cancel()
-            try:
-                await process_task
-            except (asyncio.CancelledError, Exception):
-                pass
         if active_websockets.get(session_id) is websocket:
             active_websockets.pop(session_id, None)
-        if sessions.get(session_id) is session:
-            sessions.pop(session_id, None)
+        sessions.pop(session_id, None)
 
 
 @app.get("/v1/models")
@@ -263,14 +276,16 @@ async def models():
 
 
 async def process_session_audio(websocket: WebSocket, session_id: str, session: dict):
-    """Process accumulated audio through ASR -> LLM -> TTS pipeline."""
+    """Process accumulated audio through ASR -> LLM -> TTS pipeline using full pipeline with memory."""
     send_lock: asyncio.Lock = session["send_lock"]
     tmp_path = None
     output_path = None
     session["busy"] = True
 
     async def emit(payload: dict) -> None:
-        await send_json(websocket, send_lock, payload)
+        async with send_lock:
+            if websocket.client_state.name == "CONNECTED":
+                await websocket.send_text(json.dumps(payload))
 
     try:
         print(f"WS {session_id} process_session_audio start")
@@ -301,6 +316,7 @@ async def process_session_audio(websocket: WebSocket, session_id: str, session: 
 
         await emit({"type": "status", "message": "Processing audio..."})
 
+        # Step 1: ASR
         print(f"WS {session_id} calling ASR...")
         asr_result = await transcribe(tmp_path, "en-US")
         transcript = asr_result.get("text", "").strip()
@@ -316,10 +332,17 @@ async def process_session_audio(websocket: WebSocket, session_id: str, session: 
         await emit({"type": "transcript", "text": transcript})
         await emit({"type": "status", "message": "Generating response..."})
 
-        print(f"WS {session_id} calling LLM...")
-        # Run the blocking HTTP client off the event loop so Uvicorn can
-        # still answer WebSocket pings while DeepSeek is thinking.
-        response_text = await asyncio.to_thread(generate_response, transcript)
+        # Get history and generate response
+        user_id = settings.default_user_id
+        from .memory import get_memory_store
+        memory = get_memory_store()
+        await memory.connect()
+        
+        history = await memory.get_history_as_messages(settings.default_user_id, session_id)
+        
+        print(f"WS {session_id} calling LLM with history...")
+        from .llm import generate_response_with_history
+        response_text = await asyncio.to_thread(generate_response_with_history, transcript, history)
         preview = (response_text or "")[:50]
         print(f"WS {session_id} LLM response: '{preview}...'")
 
@@ -330,11 +353,16 @@ async def process_session_audio(websocket: WebSocket, session_id: str, session: 
             })
             return
 
-        await emit({"type": "response_text", "text": response_text})
+        # Store in memory
+        await memory.add_turn(settings.default_user_id, session_id, "user", transcript)
+        await memory.add_turn(settings.default_user_id, session_id, "assistant", response_text)
+
+        # TTS Synthesis
         await emit({"type": "status", "message": "Synthesizing speech..."})
 
         output_path = f"/tmp/response_{session_id}.wav"
         print(f"WS {session_id} calling TTS...")
+        from .tts import synthesize
         await synthesize(
             text=response_text,
             language="en-US",
@@ -343,29 +371,76 @@ async def process_session_audio(websocket: WebSocket, session_id: str, session: 
         )
         print(f"WS {session_id} TTS done: {output_path}")
 
-        await emit({"type": "status", "message": "Streaming audio..."})
-
+        # Read audio data
         with open(output_path, "rb") as f:
             audio_data = f.read()
 
         print(f"WS {session_id} sending {len(audio_data)} bytes audio in chunks")
 
+        # Split response text into sentences for synchronized streaming
+        import re
+        sentences = re.split(r'(?<=[.!?])\s+', response_text.strip())
+        if not sentences:
+            sentences = [response_text]
+        
+        # Calculate audio bytes per sentence (rough estimation)
+        total_audio_bytes = len(audio_data)
+        bytes_per_sentence = total_audio_bytes // max(len(sentences), 1)
+        
+        await emit({"type": "status", "message": "Speaking..."})
+        
+        # Stream text and audio together
+        audio_offset = 0
         chunk_size = 16384
-        for i in range(0, len(audio_data), chunk_size):
-            chunk = audio_data[i:i + chunk_size]
+        
+        for i, sentence in enumerate(sentences):
+            # Send text chunk
+            await emit({
+                "type": "response_chunk",
+                "text": sentence + (" " if i < len(sentences) - 1 else ""),
+                "is_final": i == len(sentences) - 1
+            })
+            
+            # Send corresponding audio chunks
+            sentence_audio_bytes = min(bytes_per_sentence, total_audio_bytes - audio_offset)
+            if sentence_audio_bytes <= 0:
+                sentence_audio_bytes = min(chunk_size, total_audio_bytes - audio_offset)
+            
+            # Send audio in smaller chunks for smooth playback
+            while sentence_audio_bytes > 0:
+                send_chunk = min(chunk_size, sentence_audio_bytes)
+                chunk = audio_data[audio_offset:audio_offset + send_chunk]
+                await emit({
+                    "type": "audio_chunk",
+                    "data": base64.b64encode(chunk).decode(),
+                    "is_final": False
+                })
+                audio_offset += send_chunk
+                sentence_audio_bytes -= send_chunk
+                await asyncio.sleep(0.01)  # Small delay for smooth streaming
+        
+        # Send any remaining audio
+        while audio_offset < total_audio_bytes:
+            send_chunk = min(chunk_size, total_audio_bytes - audio_offset)
+            chunk = audio_data[audio_offset:audio_offset + send_chunk]
             await emit({
                 "type": "audio_chunk",
                 "data": base64.b64encode(chunk).decode(),
-                "is_final": i + chunk_size >= len(audio_data),
+                "is_final": audio_offset + send_chunk >= total_audio_bytes
             })
+            audio_offset += send_chunk
+            await asyncio.sleep(0.01)
 
         await emit({"type": "audio_end"})
+        await emit({"type": "status", "message": "Ready"})
 
     except asyncio.CancelledError:
         print(f"WS {session_id} processing cancelled")
         raise
     except Exception as e:
         print(f"WS {session_id} processing error: {e}")
+        import traceback
+        traceback.print_exc()
         try:
             await emit({
                 "type": "error",
@@ -375,10 +450,13 @@ async def process_session_audio(websocket: WebSocket, session_id: str, session: 
             pass
     finally:
         session["busy"] = False
-        if tmp_path:
-            Path(tmp_path).unlink(missing_ok=True)
-        if output_path:
-            Path(output_path).unlink(missing_ok=True)
+        # cleanup temp files
+        import glob
+        for f in glob.glob(f"/tmp/*{session_id}*.wav"):
+            try:
+                Path(f).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 # Streaming version (LLM tokens -> TTS streaming)
@@ -473,6 +551,17 @@ async def websocket_stream_endpoint(websocket: WebSocket, session_id: str):
         }))
     finally:
         await websocket.close()
+
+
+@app.get("/v1/models")
+async def models():
+    """OpenAI-compatible models endpoint."""
+    return {
+        "object": "list",
+        "data": [
+            {"id": "voice-assistant", "object": "model", "owned_by": "local"}
+        ]
+    }
 
 
 if __name__ == "__main__":
