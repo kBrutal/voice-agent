@@ -8,6 +8,8 @@ dependencies = [
     "aiohttp>=3.14.3",
     "dotenv>=0.9.9",
     "openai>=2.54.0",
+    "ddgs>=9.0.0",
+    "pydub>=0.25.1",
     "pipecat-ai[cartesia,deepgram,openai,silero,webrtc]>=0.0.108",
     "fastapi>=0.115.0",
     "uvicorn>=0.32.0",
@@ -16,6 +18,7 @@ dependencies = [
     "pymongo>=4.6",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
+    "fast-langdetect>=1.0.1",
 ]
 
 [project.optional-dependencies]

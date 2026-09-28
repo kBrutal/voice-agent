@@ -2,8 +2,11 @@ import argparse
 import asyncio
 from pathlib import Path
 
+from pymongo.errors import PyMongoError
+
 from .asr import transcribe
-from .llm import generate_response_with_history
+from .agent import get_agent, AgentStep
+from .language import detect_language, language_name
 from .tts import synthesize
 from .memory import get_memory_store
 from .config import settings
@@ -41,34 +44,53 @@ async def process_audio(
     user_id = user_id or settings.default_user_id
     session_id = session_id or "default"
 
-    # Get memory store
     memory = get_memory_store()
-    await memory.connect()
 
-    # Step 1: ASR - Transcribe audio to text (always use en-US)
-    asr_result = await transcribe(audio_path, "en-US")
+    # Step 1: ASR - Transcribe audio to text, auto-detecting the spoken language
+    asr_result = await transcribe(audio_path, "auto")
     transcript = asr_result.get("text", "").strip()
 
     if not transcript:
         raise RuntimeError("ASR returned empty transcript")
 
-    # Step 2: Get conversation history from memory
-    history = await memory.get_history_as_messages(user_id, session_id)
+    user_language = detect_language(transcript, asr_hint=asr_result.get("language"))
+    print(f"[language] {user_language}")
 
-    # Step 3: LLM - Generate response with history
-    response_text = generate_response_with_history(transcript, history)
+    # Step 2: Get conversation history from memory (best-effort)
+    memory_ok = True
+    try:
+        await memory.connect()
+        history = await memory.get_history_as_messages(user_id, session_id)
+    except PyMongoError as e:
+        memory_ok = False
+        history = []
+        print(f"[warning] memory unavailable, continuing without history: {str(e).splitlines()[0][:160]}")
+
+    # Step 3: Agent - Observe -> Reason -> Act -> ... -> Finish (with tool calling)
+    async def print_step(step: AgentStep) -> None:
+        print(f"[{step.kind}] {step.content}")
+
+    agent = get_agent()
+    result = await agent.run(
+        transcript, history, on_step=print_step, language=language_name(user_language)
+    )
+    response_text = result.final_response
 
     if not response_text.strip():
         raise RuntimeError("LLM returned empty response")
 
     # Step 4: Store in memory (user turn + assistant response)
-    await memory.add_turn(user_id, session_id, "user", transcript)
-    await memory.add_turn(user_id, session_id, "assistant", response_text)
+    if memory_ok:
+        try:
+            await memory.add_turn(user_id, session_id, "user", transcript)
+            await memory.add_turn(user_id, session_id, "assistant", response_text)
+        except PyMongoError as e:
+            print(f"[warning] failed to save turn to memory: {str(e).splitlines()[0][:160]}")
 
-    # Step 5: TTS - Synthesize response to audio (always use en-US)
+    # Step 5: TTS - Synthesize response in the language it was written in
     output = await synthesize(
         text=response_text,
-        language="en-US",
+        language=detect_language(response_text, fallback=user_language),
         voice=voice,
         output_path=output_path,
     )

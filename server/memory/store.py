@@ -26,7 +26,8 @@ class MongoMemoryStore:
     async def connect(self):
         """Initialize MongoDB connection."""
         if self._client is None:
-            self._client = AsyncIOMotorClient(self.uri)
+            # Fail fast when Atlas is unreachable instead of blocking each turn for 30s.
+            self._client = AsyncIOMotorClient(self.uri, serverSelectionTimeoutMS=5000)
             self._db = self._client[self.db_name]
             await self._create_indexes()
             logger.info(f"Connected to MongoDB: {self.db_name}")

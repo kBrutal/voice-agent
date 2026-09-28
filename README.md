@@ -1,10 +1,12 @@
 # Voice Assistant
 
-Real-time voice AI chat with conversation memory. Speak to an AI and hear it respond, with full context from previous conversations.
+Real-time voice AI chat with conversation memory and an agentic loop. Speak to an AI and hear it respond, with full context from previous conversations and the ability to search the web when it needs current information.
 
 ## Features
 
-- **Voice Interface**: Record → transcribe (ASR) → generate response (LLM) → synthesize speech (TTS)
+- **Voice Interface**: Record → transcribe (ASR) → agent response (LLM + tools) → synthesize speech (TTS)
+- **Agent Loop**: Observe → Reason → Act → Observe → ... → Finish, with tool calling (web search) and plain conversational replies for simple turns
+- **Multilingual**: Detects the spoken language each turn and replies in it — English, Spanish, German, French, Italian, Vietnamese, and Hindi (the languages the TTS can speak)
 - **Conversation Memory**: MongoDB Atlas stores history with auto-summarization
 - **Session Management**: Multiple conversations with history sidebar
 - **Interrupt Anytime**: Stop recording, processing, or playback mid-stream
@@ -14,7 +16,7 @@ Real-time voice AI chat with conversation memory. Speak to an AI and hear it res
 | Layer | Technology |
 |-------|-----------|
 | ASR | NeMo Speech (Nemotron 3.5) |
-| LLM | DeepSeek V4 Pro |
+| Agent / LLM | DeepSeek V4 Pro (tool calling) + DuckDuckGo web search |
 | TTS | NeMo Speech (Magpie Multilingual) |
 | Database | MongoDB Atlas |
 | Server | FastAPI + WebSocket |
@@ -26,13 +28,16 @@ Real-time voice AI chat with conversation memory. Speak to an AI and hear it res
 va/
 ├── server/
 │   ├── asr.py          # ASR client
-│   ├── llm.py          # DeepSeek LLM with memory
+│   ├── llm.py          # DeepSeek client + summarization (used by memory)
 │   ├── tts.py          # TTS client
+│   ├── language.py     # Spoken-language detection → TTS locale
+│   ├── agent/          # Single-agent Observe/Reason/Act/Finish loop + tools
+│   │   ├── agent.py    # Agent class, get_agent(), CLI
+│   │   └── tools/      # Tool base/registry, web_search (DuckDuckGo)
 │   ├── pipeline.py     # Full pipeline (CLI)
 │   ├── web_server.py   # WebSocket server
 │   ├── config.py       # Settings from .env
-│   ├── memory/         # MongoDB memory with summarization
-│   └── static/         # Old HTML client
+│   └── memory/         # MongoDB memory with summarization
 ├── client-react/       # React frontend
 └── client/             # Python CLI client
 ```
@@ -85,12 +90,23 @@ npm run dev --directory client-react
 ## CLI Usage
 
 ```bash
-# Single audio file (with session memory)
+# Single audio file (with session memory), runs through the agent
 uv run python -m server.pipeline samples/audio.wav --session-id my_session
 
 # Interactive recording
 uv run python -m client.cli_client --loop
+
+# Agent only (text in, text out) — no ASR/TTS/Mongo required
+uv run python -m server.agent.agent "what's today's date and any major tech news?"
 ```
+
+The agent CLI auto-detects the input language too, e.g.
+`uv run python -m server.agent.agent "¿Cuál es la capital de Australia?"` replies in Spanish.
+To check detection on its own: `uv run python -m server.language "Wie spät ist es?"`.
+
+The agent CLI prints each step of the Observe → Reason → Act → Finish loop as it
+runs (e.g. `[tool_call] Calling web_search(...)`, `[tool_result] ...`), followed
+by the final response — useful for testing the web search tool in isolation.
 
 ## Configuration
 
@@ -100,3 +116,5 @@ Edit `server/config.py` or set environment variables:
 |-----|---------|-------------|
 | `MEMORY_MAX_TURNS` | 10 | History turns injected into LLM |
 | `MEMORY_SUMMARIZE_THRESHOLD` | 20 | Auto-summarize after N turns |
+| `AGENT_MAX_ITERATIONS` | 6 | Max Reason/Act loop iterations before forcing a final answer |
+| `AGENT_SEARCH_MAX_RESULTS` | 5 | Max results returned per web search |

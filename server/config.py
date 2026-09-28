@@ -18,7 +18,11 @@ class Settings(BaseSettings):
     # Memory settings
     memory_max_turns: int = 10
     memory_summarize_threshold: int = 20
-    
+
+    # Agent settings
+    agent_max_iterations: int = 6
+    agent_search_max_results: int = 5
+
     # NeMo Speech Server
     nemo_asr_url: str = "http://127.0.0.1:8080/v1/audio/transcriptions"
     nemo_tts_url: str = "http://127.0.0.1:8080/v1/audio/speech"

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { messagesStorageKey } from './useSessions';
 
-interface Message {
+export interface Message {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
@@ -9,33 +10,181 @@ interface Message {
   isComplete?: boolean;
 }
 
-interface Session {
-  id: string;
-  title: string;
-  messages: Message[];
-  createdAt: Date;
-  updatedAt: Date;
+function loadMessages(sessionId: string | null): Message[] {
+  if (!sessionId) return [];
+  try {
+    const stored = localStorage.getItem(messagesStorageKey(sessionId));
+    if (!stored) return [];
+    return JSON.parse(stored).map((m: Message) => ({
+      ...m,
+      timestamp: new Date(m.timestamp),
+      isComplete: true
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
 }
 
 interface WebSocketMessage {
-  type: 'audio_chunk' | 'audio_end' | 'transcript' | 'response_text' | 'response_chunk' | 'audio_chunk_response' | 'audio_end_response' | 'status' | 'error' | 'config' | 'interrupt' | 'ping' | 'pong';
+  type: 'audio_segment' | 'audio_end' | 'transcript' | 'status' | 'error' | 'ping' | 'pong' | 'agent_step';
   data?: string;
   text?: string;
   message?: string;
-  is_final?: boolean;
+  index?: number;
+  is_last?: boolean;
+  kind?: 'reason' | 'tool_call' | 'tool_result' | 'finish';
+  content?: string;
+  tool_name?: string;
+  tool_args?: Record<string, unknown>;
+}
+
+export interface AgentStep {
+  id: string;
+  kind: 'reason' | 'tool_call' | 'tool_result' | 'finish';
+  content: string;
+  toolName?: string;
+  toolArgs?: Record<string, unknown>;
+  timestamp: Date;
 }
 
 export function useVoiceWebSocket(sessionId: string | null) {
   const [isConnected, setIsConnected] = useState(false);
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<Message[]>(() => loadMessages(sessionId));
   const [status, setStatus] = useState<'idle' | 'connecting' | 'recording' | 'processing' | 'speaking' | 'error'>('idle');
   const [error, setError] = useState<string | null>(null);
-  
+  const [agentSteps, setAgentSteps] = useState<AgentStep[]>([]);
+  const [voicePending, setVoicePending] = useState(false);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    try {
+      localStorage.setItem(messagesStorageKey(sessionId), JSON.stringify(messages));
+    } catch (e) {
+      console.error('Failed to save messages:', e);
+    }
+  }, [sessionId, messages]);
+
   const wsRef = useRef<WebSocket | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Reply audio arrives as a sequence of WAV segments; they're decoded in order
+  // and scheduled back to back. `playbackGenRef` invalidates in-flight decodes
+  // after an interrupt so stale segments never start playing.
+  const playChainRef = useRef<Promise<void>>(Promise.resolve());
+  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const nextStartTimeRef = useRef(0);
+  const serverDoneRef = useRef(true);
+  const playbackGenRef = useRef(0);
+  const textTimersRef = useRef<number[]>([]);
+
+  const appendAssistantWord = (word: string) => {
+    setMessages(prev => {
+      const last = prev[prev.length - 1];
+      if (last && last.role === 'assistant' && !last.isComplete) {
+        return [...prev.slice(0, -1), { ...last, content: `${last.content} ${word}` }];
+      }
+      return [...prev, {
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        content: word,
+        timestamp: new Date(),
+        isComplete: false
+      }];
+    });
+  };
+
+  const completeAssistantMessage = () => {
+    setMessages(prev => {
+      const last = prev[prev.length - 1];
+      if (last && last.role === 'assistant' && !last.isComplete) {
+        return [...prev.slice(0, -1), { ...last, isComplete: true }];
+      }
+      return prev;
+    });
+  };
+
+  const getAudioContext = () => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AudioContext();
+    }
+    return audioContextRef.current;
+  };
+
+  const resetPlayback = () => {
+    playbackGenRef.current += 1;
+    activeSourcesRef.current.forEach(source => {
+      try {
+        source.stop();
+      } catch {
+        // already stopped
+      }
+    });
+    activeSourcesRef.current = [];
+    textTimersRef.current.forEach(timer => clearTimeout(timer));
+    textTimersRef.current = [];
+    nextStartTimeRef.current = 0;
+    playChainRef.current = Promise.resolve();
+  };
+
+  const enqueuePlayback = (task: (generation: number) => Promise<void>) => {
+    const generation = playbackGenRef.current;
+    playChainRef.current = playChainRef.current
+      .then(() => (generation === playbackGenRef.current ? task(generation) : undefined))
+      .catch(e => console.error('Audio playback error:', e));
+  };
+
+  const scheduleSegment = async (base64Wav: string, text: string, isLast: boolean, generation: number) => {
+    const ctx = getAudioContext();
+    await ctx.resume();
+    const buffer = await ctx.decodeAudioData(base64ToArrayBuffer(base64Wav));
+    if (generation !== playbackGenRef.current) return;
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+    const startAt = Math.max(ctx.currentTime + 0.05, nextStartTimeRef.current);
+    source.start(startAt);
+    nextStartTimeRef.current = startAt + buffer.duration;
+    activeSourcesRef.current.push(source);
+
+    // Reveal each word when the voice should be reaching it, estimated by
+    // the word's character position within this segment's audio duration.
+    const startDelayMs = (startAt - ctx.currentTime) * 1000;
+    const durationMs = buffer.duration * 1000;
+    const words = text.split(/\s+/).filter(Boolean);
+    const totalChars = Math.max(text.length, 1);
+    let offset = 0;
+    for (const word of words) {
+      const delay = startDelayMs + durationMs * (offset / totalChars);
+      textTimersRef.current.push(window.setTimeout(() => appendAssistantWord(word), delay));
+      offset += word.length + 1;
+    }
+    textTimersRef.current.push(window.setTimeout(() => {
+      setStatus('speaking');
+      setVoicePending(false);
+    }, startDelayMs));
+    if (isLast) {
+      textTimersRef.current.push(window.setTimeout(completeAssistantMessage, startDelayMs + durationMs));
+    }
+
+    source.onended = () => {
+      activeSourcesRef.current = activeSourcesRef.current.filter(s => s !== source);
+      if (activeSourcesRef.current.length === 0 && serverDoneRef.current) {
+        setStatus('idle');
+      }
+    };
+  };
 
   // Initialize WebSocket
   useEffect(() => {
@@ -92,6 +241,10 @@ export function useVoiceWebSocket(sessionId: string | null) {
   const handleMessage = useCallback((msg: WebSocketMessage) => {
     switch (msg.type) {
       case 'transcript':
+        resetPlayback();
+        serverDoneRef.current = false;
+        setVoicePending(false);
+        setAgentSteps([]);
         setMessages(prev => [...prev, {
           id: crypto.randomUUID(),
           role: 'user',
@@ -101,135 +254,48 @@ export function useVoiceWebSocket(sessionId: string | null) {
         setStatus('processing');
         break;
 
-      case 'response_text':
-        // Full response (fallback/compatibility)
-        setMessages(prev => [...prev, {
+      case 'agent_step':
+        setAgentSteps(prev => [...prev, {
           id: crypto.randomUUID(),
-          role: 'assistant',
-          content: msg.text || '',
-          timestamp: new Date(),
-          isComplete: true
+          kind: msg.kind || 'reason',
+          content: msg.content || '',
+          toolName: msg.tool_name,
+          toolArgs: msg.tool_args,
+          timestamp: new Date()
         }]);
-        setStatus('speaking');
         break;
 
-      case 'response_chunk':
-        // Streaming text chunk - append to last assistant message or create new
-        setMessages(prev => {
-          const lastMsg = prev[prev.length - 1];
-          if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.isComplete) {
-            return [
-              ...prev.slice(0, -1),
-              { ...lastMsg, content: lastMsg.content + (msg.text || ''), isComplete: msg.is_final || false }
-            ];
-          } else {
-            return [...prev, {
-              id: crypto.randomUUID(),
-              role: 'assistant',
-              content: msg.text || '',
-              timestamp: new Date(),
-              isComplete: msg.is_final || false
-            }];
-          }
-        });
-        if (!msg.is_final) {
-          setStatus('speaking');
-        }
-        break;
-
-      case 'audio_chunk':
-        // Accumulate audio chunks
+      case 'audio_segment':
         if (msg.data) {
-          accumulateAudioChunk(msg.data, msg.is_final || false);
+          const data = msg.data;
+          const text = msg.text || '';
+          const isLast = msg.is_last ?? false;
+          enqueuePlayback(generation => scheduleSegment(data, text, isLast, generation));
         }
         break;
 
       case 'audio_end':
-        // Play accumulated audio and mark message complete
-        playAccumulatedAudio();
-        setStatus('idle');
-        setMessages(prev => {
-          const lastMsg = prev[prev.length - 1];
-          if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.isComplete) {
-            return [...prev.slice(0, -1), { ...lastMsg, isComplete: true }];
-          }
-          return prev;
+        enqueuePlayback(async () => {
+          serverDoneRef.current = true;
+          if (activeSourcesRef.current.length === 0) setStatus('idle');
         });
         break;
 
-      case 'status':
-        const statusMsg = msg.message?.toLowerCase().replace(/\s+/g, '_') || '';
-        if (statusMsg.includes('process') || statusMsg.includes('generat') || statusMsg.includes('synthes') || statusMsg.includes('stream')) {
+      case 'status': {
+        const statusMsg = msg.message?.toLowerCase() || '';
+        if (['process', 'generat', 'convert'].some(k => statusMsg.includes(k))) {
           setStatus('processing');
-        } else if (statusMsg === 'speaking') {
-          setStatus('speaking');
-        } else if (statusMsg === 'ready' || statusMsg === 'idle') {
-          setStatus('idle');
+        } else if (statusMsg.includes('synthes')) {
+          setVoicePending(true);
         }
         break;
+      }
 
       case 'error':
         setError(msg.message || 'Unknown error');
         setStatus('error');
         setTimeout(() => setStatus('idle'), 3000);
         break;
-    }
-  }, []);
-
-  // Accumulate audio chunks
-  const accumulatedAudioRef = useRef<Uint8Array[]>([]);
-  
-  const accumulateAudioChunk = useCallback((base64Data: string, isFinal: boolean) => {
-    const binaryString = atob(base64Data);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
-    }
-    
-    accumulatedAudioRef.current.push(bytes);
-    
-    if (isFinal) {
-      playAccumulatedAudio();
-    }
-  }, []);
-
-  // Play accumulated audio as a single WAV file
-  const playAccumulatedAudio = useCallback(async () => {
-    if (accumulatedAudioRef.current.length === 0) return;
-    
-    // Combine all chunks
-    const totalLength = accumulatedAudioRef.current.reduce((sum, chunk) => sum + chunk.length, 0);
-    const combined = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of accumulatedAudioRef.current) {
-      combined.set(chunk, offset);
-      offset += chunk.length;
-    }
-    
-    // Clear accumulation for next playback
-    accumulatedAudioRef.current = [];
-    
-    if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 22050 });
-    }
-    
-    try {
-      // Decode the complete WAV file
-      const audioBuffer = await audioContextRef.current.decodeAudioData(combined.buffer);
-      const source = audioContextRef.current.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(audioContextRef.current.destination);
-      currentAudioRef.current = source as any; // Store reference for interrupt
-      
-      source.start(0);
-      
-      await new Promise(resolve => {
-        source.onended = resolve;
-      });
-      
-      currentAudioRef.current = null;
-    } catch (e) {
-      console.error('Audio decode error:', e);
     }
   }, []);
 
@@ -301,19 +367,10 @@ export function useVoiceWebSocket(sessionId: string | null) {
       mediaRecorderRef.current.stop();
     }
 
-    // Stop current audio playback
-    if (currentAudioRef.current) {
-      try {
-        (currentAudioRef.current as any).stop();
-      } catch {
-        (currentAudioRef.current as any).pause();
-        (currentAudioRef.current as any).currentTime = 0;
-      }
-      currentAudioRef.current = null;
-    }
-
-    // Clear accumulated audio
-    accumulatedAudioRef.current = [];
+    resetPlayback();
+    serverDoneRef.current = true;
+    setVoicePending(false);
+    completeAssistantMessage();
 
     // Send interrupt to server
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -341,10 +398,13 @@ export function useVoiceWebSocket(sessionId: string | null) {
     messages,
     status,
     error,
+    agentSteps,
+    voicePending,
     startRecording,
     stopRecording,
     interrupt,
     sendText,
-    clearMessages: () => setMessages([])
+    clearMessages: () => setMessages([]),
+    clearAgentSteps: () => setAgentSteps([])
   };
 }

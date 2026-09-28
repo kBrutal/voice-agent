@@ -1,20 +1,19 @@
 import asyncio
 import base64
 import json
-import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydub import AudioSegment
+from pymongo.errors import PyMongoError
 
-from .pipeline import process_audio
 from .asr import transcribe
-from .llm import generate_response
-from .tts import synthesize
+from .agent import get_agent, AgentStep
+from .language import DEFAULT_LANGUAGE, detect_language, language_name
+from .tts import split_for_tts, synthesize
+from .memory import get_memory_store
 from .config import settings
 
 
@@ -136,6 +135,13 @@ def ensure_wav_format(audio_data: bytes, sample_rate: int = 16000) -> bytes:
         return wav_buffer.getvalue()
 
 
+def short_error(e: Exception, limit: int = 160) -> str:
+    """First line of an exception message, truncated — pymongo errors can be kilobytes long."""
+    first_line = str(e).splitlines()[0] if str(e) else type(e).__name__
+    first_line = first_line.split(",SSL handshake failed")[0]
+    return first_line if len(first_line) <= limit else first_line[:limit] + "…"
+
+
 async def send_json(websocket: WebSocket, lock: asyncio.Lock, payload: dict) -> None:
     """Send a JSON message without racing other writers on the same socket."""
     async with lock:
@@ -145,38 +151,22 @@ async def send_json(websocket: WebSocket, lock: asyncio.Lock, payload: dict) -> 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    static_dir = Path(__file__).parent / "static"
-    static_dir.mkdir(exist_ok=True)
-    
-    # Initialize memory store
-    from .memory import get_memory_store
-    memory = get_memory_store()
-    await memory.connect()
-    
+    try:
+        await get_memory_store().connect()
+    except PyMongoError as e:
+        print(f"WARNING: MongoDB unavailable, running without conversation memory: {short_error(e)}")
+
     yield
-    
+
     # Shutdown
     sessions.clear()
-    from .memory import get_memory_store
-    store = get_memory_store()
-    if store:
-        await store.close()
+    await get_memory_store().close()
 
 
 app = FastAPI(title="Voice Assistant", lifespan=lifespan)
 
 # Track active WebSocket connections
 active_websockets: dict[str, WebSocket] = {}
-
-# Serve static files
-static_dir = Path(__file__).parent / "static"
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
-
-
-@app.get("/")
-async def index():
-    return FileResponse(static_dir / "index.html")
 
 
 @app.get("/health")
@@ -187,12 +177,8 @@ async def health():
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await websocket.accept()
-    send_lock = asyncio.Lock()
     active_websockets[session_id] = websocket
     print(f"WebSocket connected: {session_id}")
-
-    # User ID (single user for now)
-    user_id = settings.default_user_id
 
     sessions[session_id] = {
         "audio_buffer": bytearray(),
@@ -202,7 +188,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         "send_lock": asyncio.Lock(),
     }
     session = sessions[session_id]
-    process_task: asyncio.Task | None = None
 
     try:
         while True:
@@ -230,7 +215,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     })
                     continue
                 session["busy"] = True
-                process_task = asyncio.create_task(
+                session["process_task"] = asyncio.create_task(
                     process_session_audio(websocket, session_id, session)
                 )
 
@@ -318,9 +303,17 @@ async def process_session_audio(websocket: WebSocket, session_id: str, session: 
 
         # Step 1: ASR
         print(f"WS {session_id} calling ASR...")
-        asr_result = await transcribe(tmp_path, "en-US")
+        asr_result = await transcribe(tmp_path, "auto")
         transcript = asr_result.get("text", "").strip()
         print(f"WS {session_id} ASR result: '{transcript}'")
+
+        user_language = detect_language(
+            transcript,
+            asr_hint=asr_result.get("language"),
+            fallback=session.get("language", DEFAULT_LANGUAGE),
+        )
+        session["language"] = user_language
+        print(f"WS {session_id} detected language: {user_language}")
 
         if not transcript:
             await emit({
@@ -332,19 +325,36 @@ async def process_session_audio(websocket: WebSocket, session_id: str, session: 
         await emit({"type": "transcript", "text": transcript})
         await emit({"type": "status", "message": "Generating response..."})
 
-        # Get history and generate response
-        user_id = settings.default_user_id
-        from .memory import get_memory_store
+        # Memory is best-effort: if MongoDB is unreachable, answer without history
+        # rather than failing the whole turn.
         memory = get_memory_store()
-        await memory.connect()
-        
-        history = await memory.get_history_as_messages(settings.default_user_id, session_id)
-        
-        print(f"WS {session_id} calling LLM with history...")
-        from .llm import generate_response_with_history
-        response_text = await asyncio.to_thread(generate_response_with_history, transcript, history)
+        memory_ok = True
+        try:
+            await memory.connect()
+            history = await memory.get_history_as_messages(settings.default_user_id, session_id)
+        except PyMongoError as e:
+            memory_ok = False
+            history = []
+            print(f"WS {session_id} WARNING: memory unavailable, continuing without history: {short_error(e)}")
+
+        print(f"WS {session_id} running agent with history...")
+
+        async def emit_step(step: AgentStep) -> None:
+            await emit({
+                "type": "agent_step",
+                "kind": step.kind,
+                "content": step.content,
+                "tool_name": step.tool_name,
+                "tool_args": step.tool_args,
+            })
+
+        agent = get_agent()
+        agent_result = await agent.run(
+            transcript, history, on_step=emit_step, language=language_name(user_language)
+        )
+        response_text = agent_result.final_response
         preview = (response_text or "")[:50]
-        print(f"WS {session_id} LLM response: '{preview}...'")
+        print(f"WS {session_id} agent response: '{preview}...'")
 
         if not (response_text or "").strip():
             await emit({
@@ -353,83 +363,42 @@ async def process_session_audio(websocket: WebSocket, session_id: str, session: 
             })
             return
 
-        # Store in memory
-        await memory.add_turn(settings.default_user_id, session_id, "user", transcript)
-        await memory.add_turn(settings.default_user_id, session_id, "assistant", response_text)
+        if memory_ok:
+            try:
+                await memory.add_turn(settings.default_user_id, session_id, "user", transcript)
+                await memory.add_turn(settings.default_user_id, session_id, "assistant", response_text)
+            except PyMongoError as e:
+                print(f"WS {session_id} WARNING: failed to save turn to memory: {short_error(e)}")
 
-        # TTS Synthesis
+        # TTS runs slower than real time and the speech server only returns
+        # whole clips, so synthesize chunk by chunk: the client plays chunk i
+        # while chunk i+1 is being generated.
         await emit({"type": "status", "message": "Synthesizing speech..."})
 
-        output_path = f"/tmp/response_{session_id}.wav"
-        print(f"WS {session_id} calling TTS...")
-        from .tts import synthesize
-        await synthesize(
-            text=response_text,
-            language="en-US",
-            voice="default",
-            output_path=output_path,
-        )
-        print(f"WS {session_id} TTS done: {output_path}")
+        tts_language = detect_language(response_text, fallback=user_language)
+        chunks = split_for_tts(response_text)
+        print(f"WS {session_id} TTS ({tts_language}) in {len(chunks)} chunk(s)")
 
-        # Read audio data
-        with open(output_path, "rb") as f:
-            audio_data = f.read()
+        for i, chunk in enumerate(chunks):
+            output_path = f"/tmp/response_{session_id}_{i}.wav"
+            await synthesize(
+                text=chunk,
+                language=tts_language,
+                voice="default",
+                output_path=output_path,
+            )
+            audio_data = Path(output_path).read_bytes()
+            Path(output_path).unlink(missing_ok=True)
 
-        print(f"WS {session_id} sending {len(audio_data)} bytes audio in chunks")
-
-        # Split response text into sentences for synchronized streaming
-        import re
-        sentences = re.split(r'(?<=[.!?])\s+', response_text.strip())
-        if not sentences:
-            sentences = [response_text]
-        
-        # Calculate audio bytes per sentence (rough estimation)
-        total_audio_bytes = len(audio_data)
-        bytes_per_sentence = total_audio_bytes // max(len(sentences), 1)
-        
-        await emit({"type": "status", "message": "Speaking..."})
-        
-        # Stream text and audio together
-        audio_offset = 0
-        chunk_size = 16384
-        
-        for i, sentence in enumerate(sentences):
-            # Send text chunk
             await emit({
-                "type": "response_chunk",
-                "text": sentence + (" " if i < len(sentences) - 1 else ""),
-                "is_final": i == len(sentences) - 1
+                "type": "audio_segment",
+                "index": i,
+                "text": chunk,
+                "data": base64.b64encode(audio_data).decode(),
+                "is_last": i == len(chunks) - 1,
             })
-            
-            # Send corresponding audio chunks
-            sentence_audio_bytes = min(bytes_per_sentence, total_audio_bytes - audio_offset)
-            if sentence_audio_bytes <= 0:
-                sentence_audio_bytes = min(chunk_size, total_audio_bytes - audio_offset)
-            
-            # Send audio in smaller chunks for smooth playback
-            while sentence_audio_bytes > 0:
-                send_chunk = min(chunk_size, sentence_audio_bytes)
-                chunk = audio_data[audio_offset:audio_offset + send_chunk]
-                await emit({
-                    "type": "audio_chunk",
-                    "data": base64.b64encode(chunk).decode(),
-                    "is_final": False
-                })
-                audio_offset += send_chunk
-                sentence_audio_bytes -= send_chunk
-                await asyncio.sleep(0.01)  # Small delay for smooth streaming
-        
-        # Send any remaining audio
-        while audio_offset < total_audio_bytes:
-            send_chunk = min(chunk_size, total_audio_bytes - audio_offset)
-            chunk = audio_data[audio_offset:audio_offset + send_chunk]
-            await emit({
-                "type": "audio_chunk",
-                "data": base64.b64encode(chunk).decode(),
-                "is_final": audio_offset + send_chunk >= total_audio_bytes
-            })
-            audio_offset += send_chunk
-            await asyncio.sleep(0.01)
+            if i == 0:
+                await emit({"type": "status", "message": "Speaking..."})
 
         await emit({"type": "audio_end"})
         await emit({"type": "status", "message": "Ready"})
@@ -444,7 +413,7 @@ async def process_session_audio(websocket: WebSocket, session_id: str, session: 
         try:
             await emit({
                 "type": "error",
-                "message": f"Processing error: {str(e)}",
+                "message": f"Processing error: {short_error(e)}",
             })
         except Exception:
             pass
@@ -457,111 +426,6 @@ async def process_session_audio(websocket: WebSocket, session_id: str, session: 
                 Path(f).unlink(missing_ok=True)
             except Exception:
                 pass
-
-
-# Streaming version (LLM tokens -> TTS streaming)
-@app.websocket("/ws/stream/{session_id}")
-async def websocket_stream_endpoint(websocket: WebSocket, session_id: str):
-    """Streaming version: LLM tokens feed TTS incrementally."""
-    await websocket.accept()
-    
-    try:
-        # Receive complete audio first
-        audio_chunks = []
-        while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
-            
-            if message["type"] == "audio_chunk":
-                audio_chunks.append(base64.b64decode(message["data"]))
-            elif message["type"] == "audio_end":
-                break
-        
-        # Convert audio to WAV (handles webm, wav, raw PCM)
-        webm_data = b"".join(audio_chunks)
-        if not webm_data:
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "message": "No audio data received"
-            }))
-            return
-        
-        await websocket.send_text(json.dumps({
-            "type": "status",
-            "message": "Converting audio..."
-        }))
-        
-        sample_rate = 16000  # default
-        wav_data = ensure_wav_format(webm_data, sample_rate=sample_rate)
-        
-        # Save converted WAV to temp file
-        with NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp.write(wav_data)
-            tmp_path = tmp.name
-        
-        # ASR (always use en-US)
-        asr_result = await transcribe(tmp_path, "en-US")
-        transcript = asr_result.get("text", "").strip()
-        
-        await websocket.send_text(json.dumps({
-            "type": "transcript",
-            "text": transcript
-        }))
-        
-        # Streaming LLM -> TTS
-        # Note: This requires modifying llm.py to support streaming
-        # For now, use non-streaming but send TTS in chunks
-        response_text = generate_response(transcript)
-        
-        await websocket.send_text(json.dumps({
-            "type": "response_text",
-            "text": response_text
-        }))
-        
-        output_path = f"/tmp/response_{session_id}.wav"
-        await synthesize(
-            text=response_text,
-            language="en-US",
-            voice="default",
-            output_path=output_path,
-        )
-        
-        with open(output_path, "rb") as f:
-            audio_data = f.read()
-        
-        chunk_size = 16384
-        for i in range(0, len(audio_data), chunk_size):
-            chunk = audio_data[i:i + chunk_size]
-            await websocket.send_text(json.dumps({
-                "type": "audio_chunk",
-                "data": base64.b64encode(chunk).decode(),
-                "is_final": i + chunk_size >= len(audio_data)
-            }))
-            await asyncio.sleep(0.01)
-        
-        await websocket.send_text(json.dumps({"type": "audio_end"}))
-        
-        Path(tmp_path).unlink(missing_ok=True)
-        Path(output_path).unlink(missing_ok=True)
-        
-    except Exception as e:
-        await websocket.send_text(json.dumps({
-            "type": "error",
-            "message": str(e)
-        }))
-    finally:
-        await websocket.close()
-
-
-@app.get("/v1/models")
-async def models():
-    """OpenAI-compatible models endpoint."""
-    return {
-        "object": "list",
-        "data": [
-            {"id": "voice-assistant", "object": "model", "owned_by": "local"}
-        ]
-    }
 
 
 if __name__ == "__main__":

@@ -1,6 +1,3 @@
-import argparse
-import os
-
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -20,7 +17,6 @@ if not API_KEY:
         "DEEPSEEK_API_KEY not found in .env"
     )
 
-MODEL = "deepseek-v4-pro"
 SUMMARIZE_MODEL = "deepseek-chat"  # cheaper model for summarization
 
 BASE_URL = "https://api.deepseek.com"
@@ -29,31 +25,49 @@ BASE_URL = "https://api.deepseek.com"
 SYSTEM_PROMPT = """
 You are a helpful voice assistant.
 
-Your responses will be converted directly into speech.
+## Input Context (ASR)
+Your input comes from a speech-to-text transcription system. Transcriptions may contain errors:
+- Words may be misheard, substituted, or omitted
+- Homophones may be confused (e.g., "their" vs "there")
+- Punctuation may be missing or incorrect
+- Technical terms may be transcribed phonetically
 
 Therefore:
+- Interpret intent over literal text
+- Ask for clarification if input is unclear or ambiguous
+- Politely correct obvious transcription errors when relevant
+- Use context from conversation history to disambiguate
 
-- Keep responses concise and natural.
-- Do not use Markdown.
-- Do not use tables.
-- Avoid unnecessary formatting.
-- Avoid very long explanations unless the user explicitly asks.
-- Answer the user's request directly.
-- You can understand and respond in multiple languages.
-- Match the language used by the user whenever appropriate.
+## Output Context (TTS)
+Your responses will be converted to speech via text-to-speech. Write for the ear, not the eye:
+- Use short sentences and natural phrasing
+- Write numbers as words when spoken (e.g., "twenty-five percent" not "25%")
+- Avoid symbols, abbreviations, and complex punctuation
+- Pause appropriately with commas and periods for natural rhythm
+- Avoid overly complex terminology unless asked
+- Keep responses concise—listeners cannot reread
+
+## Response Guidelines
+- Be concise and direct
+- Use simple, conversational language
+- Avoid: Markdown, tables, code blocks, URLs, email addresses
+- If listing items, use natural speech patterns ("First..., then..., finally...")
+- Ask follow-up questions when helpful
+- Match the user's language and tone
+
+## Examples
+User (ASR): "What is the weather like in New youk?"
+Assistant: "Did you mean New York? Let me check the weather there..."
+
+User (ASR): "Tell me about the T F T's."
+Assistant: "I'll tell you about ETFs—exchange-traded funds..."
 """
 
 
 # ============================================================
-# DeepSeek clients
+# DeepSeek client
 # ============================================================
 
-client = OpenAI(
-    api_key=API_KEY,
-    base_url=BASE_URL,
-)
-
-# Separate client for summarization (can use different params)
 summarize_client = OpenAI(
     api_key=API_KEY,
     base_url=BASE_URL,
@@ -63,46 +77,6 @@ summarize_client = OpenAI(
 # ============================================================
 # LLM functions
 # ============================================================
-
-def generate_response(user_input: str) -> str:
-    """
-    Generate response from user input (stateless, backward compatible).
-    """
-    return generate_response_with_history(user_input, [])
-
-
-def generate_response_with_history(
-    user_input: str, 
-    history: list[dict] | None = None
-) -> str:
-    """
-    Generate response with conversation history.
-    
-    Args:
-        user_input: Current user message
-        history: List of {"role": "user|assistant|system", "content": "..."} messages
-                (excluding the current user input)
-    """
-    if not user_input.strip():
-        raise ValueError("User input cannot be empty.")
-    
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    
-    if history:
-        messages.extend(history)
-    
-    messages.append({"role": "user", "content": user_input})
-    
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        reasoning_effort="high",
-        extra_body={"thinking": {"type": "enabled"}},
-        stream=False,
-    )
-    
-    return response.choices[0].message.content
-
 
 async def summarize_with_deepseek(text: str) -> str:
     """
@@ -124,33 +98,3 @@ async def summarize_with_deepseek(text: str) -> str:
     )
     
     return response.choices[0].message.content.strip()
-
-
-# ============================================================
-# Command-line interface
-# ============================================================
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="DeepSeek V4 Pro LLM"
-    )
-
-    parser.add_argument(
-        "input",
-        help="Text received from ASR",
-    )
-
-    args = parser.parse_args()
-
-    response = generate_response(args.input)
-
-    print("\nResponse:")
-    print(response)
-
-
-# ============================================================
-# Entry point
-# ============================================================
-
-if __name__ == "__main__":
-    main()

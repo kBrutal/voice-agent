@@ -1,11 +1,81 @@
 import argparse
 import asyncio
+import re
 from pathlib import Path
 
 import aiohttp
 
 
 NEMO_TTS_URL = "http://127.0.0.1:8080/v1/audio/speech"
+
+_SENTENCE_END = re.compile(r"(?<=[.!?।])\s+")
+_CLAUSE_BREAK = re.compile(r"(?<=[,;:])\s+")
+MIN_CHUNK_CHARS = 20
+
+
+def _split_at_clauses(text: str, limit: int) -> list[str]:
+    """Pack comma/semicolon clauses into pieces of at most `limit` chars where possible."""
+    if len(text) <= limit:
+        return [text]
+    pieces: list[str] = []
+    current = ""
+    for clause in _CLAUSE_BREAK.split(text):
+        if current and len(current) + 1 + len(clause) > limit:
+            pieces.append(current)
+            current = clause
+        else:
+            current = f"{current} {clause}".strip()
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def split_for_tts(text: str, first_max: int = 45, max_len: int = 220) -> list[str]:
+    """Split a reply into chunks that can be synthesized and played one by one.
+
+    TTS time grows with text length, so the first chunk is kept short to get
+    audio playing quickly; later chunks are whole sentences (split at commas
+    if very long). Tiny fragments are merged so playback isn't choppy.
+    """
+    text = " ".join(text.split())
+    sentences = [s.strip() for s in _SENTENCE_END.split(text) if s.strip()]
+
+    chunks: list[str] = []
+    for sentence in sentences:
+        chunks.extend(_split_at_clauses(sentence, max_len))
+
+    merged: list[str] = []
+    carry = ""
+    for chunk in chunks:
+        chunk = f"{carry} {chunk}".strip() if carry else chunk
+        if len(chunk) < MIN_CHUNK_CHARS:
+            carry = chunk
+            continue
+        merged.append(chunk)
+        carry = ""
+    if carry:
+        if merged:
+            merged[-1] = f"{merged[-1]} {carry}"
+        else:
+            merged.append(carry)
+
+    if merged and len(merged[0]) > first_max:
+        first = merged[0]
+        parts = _split_at_clauses(first, first_max)
+        head = parts[0]
+        if len(head) < MIN_CHUNK_CHARS and len(parts) > 1:
+            head = f"{head} {parts[1]}"
+        if len(head) > first_max:
+            # No usable comma: cut the first chunk at a word boundary instead,
+            # trading a little prosody for a much faster first audio.
+            cut = first.rfind(" ", MIN_CHUNK_CHARS, first_max + 1)
+            if cut != -1:
+                head = first[:cut]
+        rest = first[len(head):].strip()
+        if len(rest) >= MIN_CHUNK_CHARS:
+            merged[0:1] = [head, rest]
+
+    return merged
 
 
 async def synthesize(
