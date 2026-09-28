@@ -5,12 +5,13 @@ Single-agent Observe -> Reason -> Act -> Observe -> ... -> Finish loop with tool
 import argparse
 import asyncio
 import logging
+import re
 from typing import Awaitable, Callable
 
 from openai import AsyncOpenAI
 
 from server.config import settings
-from server.language import detect_language, language_name
+from server.language import detect_language, reply_instruction
 from server.llm import SYSTEM_PROMPT
 
 from .tools import ToolRegistry
@@ -70,7 +71,7 @@ class Agent:
         user_input: str,
         history: list[dict] | None = None,
         on_step: OnStep | None = None,
-        language: str | None = None,
+        language_instruction: str | None = None,
     ) -> AgentResult:
         """Observe -> Reason -> Act -> Observe -> ... -> Finish.
 
@@ -80,18 +81,15 @@ class Agent:
             on_step: Optional async callback invoked with each AgentStep as it
                 happens, so callers (e.g. a WebSocket handler) can surface the
                 agent's live activity without the Agent knowing about them.
-            language: Language name the reply must be written in (e.g. "Spanish").
+            language_instruction: Which language/script to reply in, from
+                `server.language.reply_instruction`.
         """
         if not user_input.strip():
             raise ValueError("User input cannot be empty.")
 
         system_prompt = self.system_prompt
-        if language:
-            system_prompt += (
-                f"\n\n## Response Language\n"
-                f"The user is speaking {language}. Write your entire reply in {language}, "
-                f"even if earlier turns or search results are in another language."
-            )
+        if language_instruction:
+            system_prompt += f"\n\n## Response Language\n{language_instruction}"
 
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
         if history:
@@ -234,11 +232,15 @@ async def _run_cli(user_input: str):
     async def print_step(step: AgentStep) -> None:
         print(f"[{step.kind}] {step.content}")
 
-    language = language_name(detect_language(user_input))
-    print(f"[language] {language}")
+    locale = detect_language(user_input)
+    is_hinglish = bool(re.search(r"[ऀ-ॿ]", user_input) and re.search(r"[A-Za-z]", user_input))
+    mode = "hinglish" if is_hinglish else None
+    print(f"[language] {locale}{' (hinglish)' if is_hinglish else ''}")
 
     agent = get_agent()
-    result = await agent.run(user_input, on_step=print_step, language=language)
+    result = await agent.run(
+        user_input, on_step=print_step, language_instruction=reply_instruction(locale, mode)
+    )
 
     print("\nResponse:")
     print(result.final_response)

@@ -7,10 +7,22 @@ import aiohttp
 # hosting it on local server port 8080
 NEMO_URL = "http://127.0.0.1:8080/v1/audio/transcriptions"
 
+# The local ASR server returns truncated, garbled, or empty transcripts when it
+# receives overlapping requests, so every call in this process is serialized.
+_asr_lock = asyncio.Lock()
+
 
 async def transcribe(
     audio_path: str,
     language: str = "auto",
+) -> dict:
+    async with _asr_lock:
+        return await _transcribe(audio_path, language)
+
+
+async def _transcribe(
+    audio_path: str,
+    language: str,
 ) -> dict:
 
     audio_file = Path(audio_path)

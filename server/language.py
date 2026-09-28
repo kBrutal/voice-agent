@@ -70,6 +70,34 @@ def language_name(locale: str) -> str:
     return SUPPORTED_LANGUAGES.get(base, SUPPORTED_LANGUAGES["en"])[1]
 
 
+def reply_instruction(locale: str, mode: str | None = None) -> str:
+    """Instruction telling the agent which language (and script) to reply in.
+
+    Hindi and Hinglish replies must be pure Devanagari: the Hindi TTS voice
+    mispronounces Latin-script English words and can't read romanized Hindi.
+    """
+    devanagari_only = (
+        "Write the entire reply in Devanagari script, transliterating any English "
+        "words or names (e.g. 'मीटिंग', 'ऑफिस', 'गूगल'), because the speech engine "
+        "can only pronounce Devanagari."
+    )
+    if mode == "hinglish":
+        return (
+            "The user is speaking Hinglish, a casual mix of Hindi and English. Reply in "
+            "the same natural Hinglish style, keeping common English words where a "
+            f"Hinglish speaker would. {devanagari_only}"
+        )
+
+    name = language_name(locale)
+    instruction = (
+        f"The user is speaking {name}. Write your entire reply in {name}, "
+        "even if earlier turns or search results are in another language."
+    )
+    if _base(locale) == "hi":
+        instruction += f" {devanagari_only}"
+    return instruction
+
+
 def main():
     parser = argparse.ArgumentParser(description="Detect spoken language from text")
     parser.add_argument("text", help="Transcript text")

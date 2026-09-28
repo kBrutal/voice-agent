@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import io
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,9 +10,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydub import AudioSegment
 from pymongo.errors import PyMongoError
 
-from .asr import transcribe
 from .agent import get_agent, AgentStep
-from .language import DEFAULT_LANGUAGE, detect_language, language_name
+from .asr_gate import gated_transcribe
+from .language import DEFAULT_LANGUAGE, detect_language, reply_instruction
 from .tts import split_for_tts, synthesize
 from .memory import get_memory_store
 from .config import settings
@@ -122,7 +123,6 @@ def ensure_wav_format(audio_data: bytes, sample_rate: int = 16000) -> bytes:
     else:
         # Raw PCM - wrap in WAV container
         # Assume 16-bit mono at sample_rate
-        import io
         import wave
         
         wav_buffer = io.BytesIO()
@@ -133,6 +133,15 @@ def ensure_wav_format(audio_data: bytes, sample_rate: int = 16000) -> bytes:
             wf.writeframes(audio_data)
         
         return wav_buffer.getvalue()
+
+
+def pad_leading_silence(wav_data: bytes, ms: int = 300) -> bytes:
+    """Prepend silence: the streaming ASR model drops the first word when speech starts at t=0."""
+    audio = AudioSegment.from_file(io.BytesIO(wav_data), format="wav")
+    padded = AudioSegment.silent(duration=ms, frame_rate=audio.frame_rate) + audio
+    out = io.BytesIO()
+    padded.export(out, format="wav")
+    return out.getvalue()
 
 
 def short_error(e: Exception, limit: int = 160) -> str:
@@ -292,6 +301,7 @@ async def process_session_audio(websocket: WebSocket, session_id: str, session: 
         wav_data = await asyncio.to_thread(
             ensure_wav_format, webm_data, sample_rate
         )
+        wav_data = await asyncio.to_thread(pad_leading_silence, wav_data)
         print(f"WS {session_id} converted to WAV: {len(wav_data)} bytes")
 
         with NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -301,19 +311,14 @@ async def process_session_audio(websocket: WebSocket, session_id: str, session: 
 
         await emit({"type": "status", "message": "Processing audio..."})
 
-        # Step 1: ASR
-        print(f"WS {session_id} calling ASR...")
-        asr_result = await transcribe(tmp_path, "auto")
-        transcript = asr_result.get("text", "").strip()
-        print(f"WS {session_id} ASR result: '{transcript}'")
-
-        user_language = detect_language(
-            transcript,
-            asr_hint=asr_result.get("language"),
-            fallback=session.get("language", DEFAULT_LANGUAGE),
-        )
+        # Step 1: ASR through the English/Hindi/auto gate
+        print(f"WS {session_id} calling ASR gate...")
+        gated = await gated_transcribe(tmp_path, fallback=session.get("language", DEFAULT_LANGUAGE))
+        transcript = gated.text
+        user_language = gated.locale
         session["language"] = user_language
-        print(f"WS {session_id} detected language: {user_language}")
+        print(f"WS {session_id} ASR gate candidates: {gated.candidates}")
+        print(f"WS {session_id} ASR result ({gated.mode}, {user_language}): '{transcript}'")
 
         if not transcript:
             await emit({
@@ -350,7 +355,10 @@ async def process_session_audio(websocket: WebSocket, session_id: str, session: 
 
         agent = get_agent()
         agent_result = await agent.run(
-            transcript, history, on_step=emit_step, language=language_name(user_language)
+            transcript,
+            history,
+            on_step=emit_step,
+            language_instruction=reply_instruction(user_language, gated.mode),
         )
         response_text = agent_result.final_response
         preview = (response_text or "")[:50]

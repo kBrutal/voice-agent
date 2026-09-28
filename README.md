@@ -6,7 +6,7 @@ Real-time voice AI chat with conversation memory and an agentic loop. Speak to a
 
 - **Voice Interface**: Record → transcribe (ASR) → agent response (LLM + tools) → synthesize speech (TTS)
 - **Agent Loop**: Observe → Reason → Act → Observe → ... → Finish, with tool calling (web search) and plain conversational replies for simple turns
-- **Multilingual**: Detects the spoken language each turn and replies in it — English, Spanish, German, French, Italian, Vietnamese, and Hindi (the languages the TTS can speak)
+- **Multilingual + Hinglish**: An ASR gate transcribes each utterance as English, Hindi, and auto-detect, then `deepseek-flash` merges them into the final input (English, Hindi, code-mixed Hinglish, or another language). Replies come back in the user's language — English, Spanish, German, French, Italian, Vietnamese, Hindi, or Hinglish (written in Devanagari so the Hindi voice can pronounce it)
 - **Conversation Memory**: MongoDB Atlas stores history with auto-summarization
 - **Session Management**: Multiple conversations with history sidebar
 - **Interrupt Anytime**: Stop recording, processing, or playback mid-stream
@@ -27,7 +27,8 @@ Real-time voice AI chat with conversation memory and an agentic loop. Speak to a
 ```
 va/
 ├── server/
-│   ├── asr.py          # ASR client
+│   ├── asr.py          # ASR client (serialized; the speech server corrupts overlapping requests)
+│   ├── asr_gate.py     # en/hi/auto transcripts → deepseek-flash → final input + mode
 │   ├── llm.py          # DeepSeek client + summarization (used by memory)
 │   ├── tts.py          # TTS client
 │   ├── language.py     # Spoken-language detection → TTS locale
@@ -103,6 +104,7 @@ uv run python -m server.agent.agent "what's today's date and any major tech news
 The agent CLI auto-detects the input language too, e.g.
 `uv run python -m server.agent.agent "¿Cuál es la capital de Australia?"` replies in Spanish.
 To check detection on its own: `uv run python -m server.language "Wie spät ist es?"`.
+To see what the ASR gate makes of a recording: `uv run python -m server.asr_gate path/to/audio.wav`.
 
 The agent CLI prints each step of the Observe → Reason → Act → Finish loop as it
 runs (e.g. `[tool_call] Calling web_search(...)`, `[tool_result] ...`), followed

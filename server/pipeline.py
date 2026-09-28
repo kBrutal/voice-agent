@@ -4,9 +4,9 @@ from pathlib import Path
 
 from pymongo.errors import PyMongoError
 
-from .asr import transcribe
 from .agent import get_agent, AgentStep
-from .language import detect_language, language_name
+from .asr_gate import gated_transcribe
+from .language import detect_language, reply_instruction
 from .tts import synthesize
 from .memory import get_memory_store
 from .config import settings
@@ -46,15 +46,15 @@ async def process_audio(
 
     memory = get_memory_store()
 
-    # Step 1: ASR - Transcribe audio to text, auto-detecting the spoken language
-    asr_result = await transcribe(audio_path, "auto")
-    transcript = asr_result.get("text", "").strip()
+    # Step 1: ASR through the English/Hindi/auto gate
+    gated = await gated_transcribe(audio_path)
+    transcript = gated.text
 
     if not transcript:
         raise RuntimeError("ASR returned empty transcript")
 
-    user_language = detect_language(transcript, asr_hint=asr_result.get("language"))
-    print(f"[language] {user_language}")
+    user_language = gated.locale
+    print(f"[language] {user_language} ({gated.mode}): {transcript}")
 
     # Step 2: Get conversation history from memory (best-effort)
     memory_ok = True
@@ -72,7 +72,10 @@ async def process_audio(
 
     agent = get_agent()
     result = await agent.run(
-        transcript, history, on_step=print_step, language=language_name(user_language)
+        transcript,
+        history,
+        on_step=print_step,
+        language_instruction=reply_instruction(user_language, gated.mode),
     )
     response_text = result.final_response
 
